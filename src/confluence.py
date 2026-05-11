@@ -54,7 +54,10 @@ def compute_20d_return(close_series: pd.Series) -> float:
     """
     if len(close_series) < 21:
         return 0.0
-    return float(close_series.iloc[-1] / close_series.iloc[-21] - 1)
+    prev = close_series.iloc[-21]
+    if prev == 0:
+        return 0.0
+    return float(close_series.iloc[-1] / prev - 1)
 
 
 # ---------------------------------------------------------------------------
