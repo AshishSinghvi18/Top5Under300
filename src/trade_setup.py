@@ -52,18 +52,22 @@ def compute_trade_setup(
     risk_per_trade = trade_cfg.get("risk_per_trade", 0.02)
     validity_days = trade_cfg.get("validity_trading_days", 2)
 
+    sma_period = trade_cfg.get("entry_sma_period", 20)
+
     if df is None or df.empty or len(df) < max(atr_period, swing_low_lb):
         return None
 
     # --- Entry ---
     close = df["Close"]
     latest_close = float(close.iloc[-1])
+    if latest_close <= 0:
+        return None
 
-    sma20 = compute_sma(close, 20)
-    latest_sma20 = float(sma20.iloc[-1]) if not np.isnan(sma20.iloc[-1]) else None
+    sma = compute_sma(close, sma_period)
+    latest_sma = float(sma.iloc[-1]) if not np.isnan(sma.iloc[-1]) else None
 
-    if latest_sma20 is not None and abs(latest_close - latest_sma20) / latest_close <= entry_sma_tol:
-        entry = latest_sma20
+    if latest_sma is not None and abs(latest_close - latest_sma) / latest_close <= entry_sma_tol:
+        entry = latest_sma
     else:
         entry = latest_close
 
