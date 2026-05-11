@@ -1,0 +1,115 @@
+# NSE Stock Screener Configuration
+# All thresholds and parameters live here. Do not hardcode in source files.
+
+screener:
+  min_price: 50.0
+  max_price: 300.0
+  min_avg_volume_20d: 100000
+  min_market_cap: 5000000000   # ₹500 crore
+  min_history_days: 200
+  allowed_series: ["EQ"]
+  corporate_action_lookahead_days: 7
+
+technical:
+  rsi_period: 14
+  rsi_lower: 50
+  rsi_upper: 70
+  rsi_state_b_lookback: 10
+  macd_fast: 12
+  macd_slow: 26
+  macd_signal: 9
+  macd_crossover_lookback: 5
+  sma_short: 20
+  sma_long: 50
+  sma_trend: 200
+  volume_surge_multiplier: 1.5
+  volume_surge_lookback_days: 3
+  volume_avg_lookback_days: 20
+  supertrend_period: 10
+  supertrend_multiplier: 3.0
+  supertrend_min_sessions: 2
+  supertrend_fresh_flip_volume_multiplier: 1.5
+  adx_period: 14
+  adx_threshold: 25
+  min_technical_conditions: 4
+
+fundamental:
+  max_pe_multiplier: 1.2
+  max_debt_to_equity: 1.5
+  min_revenue_growth: 0.0
+  min_roe: 0.10
+  promoter_holding_tolerance_pct: -1.0
+
+sentiment:
+  negative_lookback_days: 7
+  positive_lookback_days: 14
+  recency_weights:
+    near: 1.0       # 0-3 days
+    medium: 0.7     # 4-7 days
+    far: 0.4        # 8-14 days
+  min_weighted_catalyst_count: 1.0
+  dedup_fuzzy_threshold: 85
+  rss_feeds:
+    - https://www.moneycontrol.com/rss/latestnews.xml
+    - https://www.moneycontrol.com/rss/business.xml
+    - https://economictimes.indiatimes.com/markets/rssfeeds/1977021501.cms
+    - https://economictimes.indiatimes.com/markets/stocks/rssfeeds/2146842.cms
+    - https://www.livemint.com/rss/markets
+    - https://www.business-standard.com/rss/markets-106.rss
+
+trade:
+  max_sl_percent: 0.05
+  min_sl_percent: 0.005
+  target1_rr: 1.5
+  target2_rr: 2.5
+  entry_sma_tolerance: 0.02
+  atr_period: 14
+  atr_multiplier: 2.0
+  swing_low_lookback: 10
+  resistance_lookback: 50
+  high_52w_lookback: 252
+  max_position_percent: 0.20
+  risk_per_trade: 0.02
+  validity_trading_days: 2
+  gap_down_invalidation: 0.03
+
+scoring:
+  technical_weight: 0.40
+  fundamental_weight: 0.30
+  sentiment_weight: 0.20
+  sector_weight: 0.10
+  max_buy_signals: 5
+
+portfolio:
+  default_size: 100000
+
+sector_pe_fallback:
+  Auto: 25
+  IT: 28
+  Bank: 15
+  Pharma: 30
+  FMCG: 40
+  Metal: 12
+  Realty: 30
+  Energy: 15
+  Default: 22
+
+sector_pe_dynamic:
+  min_sample_size: 10
+
+performance:
+  yfinance_concurrency: 10
+  nse_concurrency: 3
+  rss_concurrency: 6
+  cache_dir: ".cache/screener"
+  price_cache_hours: 24
+  rss_cache_hours: 2
+  sector_pe_cache_hours: 24
+  asm_cache_hours: 24
+  call_timeout_seconds: 30
+  total_timeout_minutes: 30
+  retry_max_attempts: 3
+
+logging:
+  level: INFO
+  log_dir: "logs"

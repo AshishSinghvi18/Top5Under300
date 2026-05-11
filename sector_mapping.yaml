@@ -1,0 +1,37 @@
+# Maps yfinance .info["sector"] strings to NIFTY sector index tickers
+# Used by Layer 4 sector tailwind check.
+
+sector_to_index:
+  "Financial Services": "^NSEBANK"
+  "Financials": "^NSEBANK"
+  "Banks": "^NSEBANK"
+  "Technology": "^CNXIT"
+  "Information Technology": "^CNXIT"
+  "Communication Services": "^CNXIT"
+  "Consumer Cyclical": "^CNXAUTO"
+  "Automobile and Auto Components": "^CNXAUTO"
+  "Healthcare": "^CNXPHARMA"
+  "Pharmaceuticals": "^CNXPHARMA"
+  "Consumer Defensive": "^CNXFMCG"
+  "Fast Moving Consumer Goods": "^CNXFMCG"
+  "Basic Materials": "^CNXMETAL"
+  "Metals & Mining": "^CNXMETAL"
+  "Real Estate": "^CNXREALTY"
+  "Realty": "^CNXREALTY"
+  "Energy": "^CNXENERGY"
+  "Utilities": "^CNXENERGY"
+  "Oil Gas & Consumable Fuels": "^CNXENERGY"
+
+default_index: "^NSEI"
+
+# Maps NIFTY index ticker to a short label for sector_pe_fallback lookup
+index_to_pe_key:
+  "^CNXAUTO": "Auto"
+  "^CNXIT": "IT"
+  "^NSEBANK": "Bank"
+  "^CNXPHARMA": "Pharma"
+  "^CNXFMCG": "FMCG"
+  "^CNXMETAL": "Metal"
+  "^CNXREALTY": "Realty"
+  "^CNXENERGY": "Energy"
+  "^NSEI": "Default"
