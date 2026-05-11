@@ -258,7 +258,11 @@ def fetch_sector_index_returns(
             hist = t.history(period="40d")
             if hist is not None and len(hist) >= 20:
                 close = hist["Close"]
-                ret = (float(close.iloc[-1]) - float(close.iloc[-20])) / float(close.iloc[-20])
+                base = float(close.iloc[-20])
+                if base == 0:
+                    logger.debug(f"Sector index {ticker}: zero base price")
+                    continue
+                ret = (float(close.iloc[-1]) - base) / base
                 results[ticker] = ret
                 cache.set(cache_key, ret, expire=cache_hours * 3600)
             else:
@@ -296,13 +300,13 @@ def fetch_corporate_actions(
             cache.set(cache_key, result, expire=cache_hours * 3600)
             return result
 
-        now = datetime.now()
+        now = pd.Timestamp.now()
         cutoff = now + timedelta(days=lookahead_days)
         upcoming: List[Dict[str, Any]] = []
 
         for dt_idx, row in actions.iterrows():
             action_date = pd.Timestamp(dt_idx)
-            if action_date.tz is not None:
+            if action_date.tzinfo is not None:
                 action_date = action_date.tz_localize(None)
             if now <= action_date <= cutoff:
                 upcoming.append({
