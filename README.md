@@ -1,43 +1,48 @@
-# NSE Stock Screener
+# NSE Under ₹300 Momentum Scanner
 
-A rule-based, LLM-free, fully deterministic stock screener for the National Stock Exchange of India (NSE). Outputs 0–5 qualified BUY signals per day with complete trade setups: entry, stop loss, target levels, position sizing, and validity.
+A self-contained, rule-based daily stock scanner for NSE stocks priced under ₹300. Outputs up to 5 high-conviction BUY candidates per run with full trade setups, scoring, and risk analysis.
 
 ## ⚠ Disclaimer
 
-1. Screening/research tool for educational purposes only. **NOT SEBI-registered investment advice.**
-2. Past results don't guarantee future returns. Expected hit rate: 45–55%.
-3. Always verify fundamentals, news, and corporate actions independently.
+1. Educational/research tool only. **NOT SEBI-registered investment advice.**
+2. Past results don't guarantee future returns. Always validate signals independently.
+3. Always verify fundamentals, liquidity, and corporate actions before trading.
 4. Use stop losses without exception. The stop loss IS the strategy.
 5. Never risk more than 2% of capital on a single trade.
-6. Backtest before deploying real capital.
-7. Authors accept no liability for any losses.
-8. No screener reliably predicts short-term price moves. Treat signals as research candidates only.
+6. Authors accept no liability for any losses.
 
 ## What it does
 
-For each NSE stock priced between ₹50 and ₹300, this tool applies a 4-layer confluence test:
+Scans 90+ liquid NSE stocks under ₹300 using a **5-layer multi-pass shortlisting approach**:
 
-1. **Technical** — ≥4 of 6 must hold (RSI dual-state, MACD bullish crossover, SMA stack, volume surge, Supertrend, ADX > 25).
-2. **Fundamental** — PE below sector median × 1.2, D/E < 1.5, ROE > 10%, positive revenue growth.
-3. **News sentiment** — RSS-based regex matching with word-boundary regex, negation handling, recency weighting, and fuzzy deduplication. No LLM.
-4. **Sector tailwind** — Stock's sector outperforming NIFTY 50 over 20 trading days.
+| Layer | What it tests |
+|-------|--------------|
+| 1 | Price ₹50–₹300 and 20-day average volume > 100K |
+| 2 | Technical momentum (RSI, MACD crossover, SMA stack, volume surge, ADX) |
+| 3 | Fundamentals quick-check (P/E vs sector, D/E, ROE, revenue growth) |
+| 4 | Volatility & momentum scoring (ATR, 5-day return, Bollinger position, ROC) |
+| 5 | Catalyst & pattern detection (hammer, engulfing, morning star, gap-up, breakouts) |
 
-Stocks passing all 4 layers receive a trade setup with entry, ATR-based stop loss, two R:R targets, and position sizing capped at 20% of portfolio per trade.
+### Output per shortlisted stock
 
-## What it deliberately doesn't do
-
-- No LLM, ML, or AI calls anywhere. Fully deterministic.
-- No paid APIs. Free data sources only (yfinance, NSE public endpoints, RSS).
-- No claim of predictive power. The 4-layer test is a research filter.
-- No automated trading. Output is research candidates only.
+- **Stock Info**: Symbol, Company Name, Current Price, Sector
+- **Return Potential**: Estimated range (e.g., 3.5% – 7.2%)
+- **Trigger Events**: Specific signals (e.g., "MACD bullish crossover + Volume surge 2.3x + Hammer candle at support")
+- **Entry Level**: Recommended entry price
+- **3 Targets**: Conservative (1.5:1 R:R), Moderate (2.5:1 R:R), Aggressive (3.5:1 R:R)
+- **Stop Loss**: ATR-based level and % from entry
+- **Scores**: Technical (0–100), Fundamental (0–100), Confidence composite
+- **Risk Flags**: Warnings (high debt, low volume, near 52W high, etc.)
+- **Position Sizing**: For ₹1,00,000 portfolio at 2% risk per trade
+- **Validity**: 1–2 trading sessions
 
 ## Setup
 
 Requires **Python 3.10+**.
 
 ```bash
-git clone https://github.com/<you>/nse-screener.git
-cd nse-screener
+git clone https://github.com/<you>/Top5Under300.git
+cd Top5Under300
 python -m venv .venv
 source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
@@ -46,7 +51,7 @@ pip install -r requirements.txt
 ## Run
 
 ```bash
-# Default scan
+# Default scan (all 90+ stocks)
 python main.py
 
 # Custom portfolio size (₹5,00,000)
@@ -55,89 +60,62 @@ python main.py --portfolio 500000
 # Narrower price band
 python main.py --max-price 250 --min-price 100
 
-# Skip trade setups (just count qualifying stocks)
-python main.py --dry-run
-
-# Skip news layer (sentiment treated as neutral)
-python main.py --no-news
-
-# Verbose logging
+# Verbose (debug) logging
 python main.py --verbose
 
-# Limit universe for quick testing
-python main.py --limit 20
+# Quick test on first 10 stocks
+python main.py --limit 10
 ```
 
 ## Output
 
-Three files per run, plus rich console display:
+Three artifacts per run:
 
-- `output/screener_YYYYMMDD_HHMMSS.csv` — flat table of qualified BUYs
-- `output/screener_YYYYMMDD_HHMMSS.json` — full structured payload, schema_version "3.0"
-- `logs/universe_YYYYMMDD_HHMMSS.log` — per-stock pass/fail log for audit
-
-Console display includes a top-N table plus a detailed card per BUY with the technical checklist, fundamentals, trade setup, position sizing, catalysts found, sector context, risk flags, and validity expiry.
+- **Console**: Rich-formatted summary table + detailed card per stock
+- **`output/screener_YYYYMMDD_HHMMSS.csv`** — flat table of qualified BUYs
+- **`output/screener_YYYYMMDD_HHMMSS.json`** — full structured payload
 
 ## Project structure
 
 ```
-nse_screener/
-├── main.py                # CLI orchestration
-├── config.yaml            # All thresholds (no magic numbers in code)
-├── sector_mapping.yaml    # yfinance sector → NIFTY sector index
+Top5Under300/
+├── main.py            # Self-contained scanner — all logic inline, no src/ modules
+├── config.yaml        # All thresholds (edit to tune)
+├── nse_stocks.csv     # 90+ liquid NSE stocks under ₹300
+├── sector_mapping.yaml
 ├── requirements.txt
-├── data/
-│   ├── nse_stocks.csv     # Static fallback universe (~20 sample stocks)
-│   └── asm_gsm_list.csv   # Cached ASM/GSM surveillance list
-├── src/
-│   ├── indicators.py      # RSI, MACD, SMA, ATR, ADX, Supertrend
-│   ├── filters.py         # 8 hard filters
-│   ├── confluence.py      # 4-layer BUY qualification
-│   ├── news_sentiment.py  # RSS + word-boundary regex + negation + dedup
-│   ├── trade_setup.py     # Entry / SL / Targets / position sizing
-│   ├── risk_flags.py      # 15+ deterministic risk warnings
-│   ├── scorer.py          # 4-component composite score
-│   ├── data_fetcher.py    # yfinance + NSE APIs + RSS, with diskcache
-│   ├── reporter.py        # Console (rich) + CSV + JSON output
-│   └── calendar_utils.py  # NSE trading-day arithmetic
-├── tests/                 # pytest suite (64 tests)
-└── output/, logs/, .cache/
+└── output/            # Created automatically per run
 ```
 
-## Architecture decisions
+## Configuration (`config.yaml`)
 
-- **LLM-first classification rejected.** All decisions are rule-based and auditable.
-- **Confidence-scored cross-page logic** not needed — RSS items are flat documents.
-- **No survivorship bias in sector PE.** Sector median is computed from all stocks under ₹300, not the filtered universe.
-- **Crypto-shredding / GDPR.** Not applicable; only public market data is processed.
-- **Two-stage PII detection** not applicable; this tool processes no PII.
+Key thresholds you may want to tune:
 
-## Tuning
+| Setting | Default | Effect |
+|---------|---------|--------|
+| `technical.min_technical_conditions` | 4 | Require 4/5 technical conditions to pass Layer 2 |
+| `technical.adx_threshold` | 25 | ADX must exceed this to count as trending |
+| `technical.rsi_lower` / `rsi_upper` | 50 / 70 | RSI window for bullish zone |
+| `technical.volume_surge_multiplier` | 1.5 | Volume must be this multiple of 20D average |
+| `trade.atr_multiplier` | 2.0 | ATR multiplier for stop-loss distance |
+| `scoring.max_buy_signals` | 5 | Maximum stocks shown in output |
 
-If the screener returns 0 BUYs on most trading days, that is **expected behavior**. Strict confluence protects capital. To loosen:
+If the scanner returns 0 BUYs most days, that is **expected behavior** — strict confluence protects capital. To relax:
+- Reduce `technical.min_technical_conditions` from 4 to 3
+- Reduce `technical.adx_threshold` from 25 to 20
 
-- `config.yaml → technical.min_technical_conditions`: reduce from 4 to 3.
-- `config.yaml → technical.adx_threshold`: reduce from 25 to 20.
-- `config.yaml → sentiment.min_weighted_catalyst_count`: reduce from 1.0 to 0.5.
+## Dependencies
 
-Don't loosen if you don't understand the trade-off (more false positives).
+All free, no paid APIs required:
+
+- `yfinance` — price history and fundamentals
+- `ta` — RSI, MACD, ADX, Bollinger Bands, ATR, ROC
+- `pandas` / `numpy` — calculations
+- `rich` — colored console output
+- `pyyaml` — configuration loading
 
 ## Known limitations
 
-- **yfinance fundamentals can be stale or wrong** for less-followed Indian stocks. Always verify on screener.in or the company's filings.
-- **RSS-only sentiment is keyword-based**, not NLP. It catches strong signals (SEBI action, earnings beats) but misses nuance.
-- **Sector mapping is approximate.** yfinance's sector strings don't map cleanly to NIFTY sector indices; we use the best available match and fall back to NIFTY 50.
-- **No FII/DII/OI modeling.** Institutional flows and options data are not considered.
-- **NSE APIs are unreliable from datacenter IPs.** The tool handles this with graceful fallback to the static universe CSV and cached ASM lists, but expect degraded data from cloud VMs.
-
-## Testing
-
-```bash
-pytest tests/ -v
-```
-
-All 64 tests should pass. The suite covers indicators, filters, trade setup math, sentiment rules (word boundaries, negation, dedup, recency), scoring, and risk flags.
-
-## License
-
-For personal research use. Not for redistribution as financial advice.
+- **yfinance fundamentals can be stale or missing** for smaller Indian stocks. Always verify on Screener.in or company filings.
+- **No FII/DII/OI modeling.** Institutional flows not considered.
+- **No automated trading.** Output is research candidates only.
