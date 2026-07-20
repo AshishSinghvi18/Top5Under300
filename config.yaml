@@ -62,6 +62,7 @@ trade:
   min_sl_percent: 0.005
   target1_rr: 1.5
   target2_rr: 2.5
+  target3_rr: 3.5
   entry_sma_tolerance: 0.02
   atr_period: 14
   atr_multiplier: 2.0
@@ -76,8 +77,6 @@ trade:
 scoring:
   technical_weight: 0.40
   fundamental_weight: 0.30
-  sentiment_weight: 0.20
-  sector_weight: 0.10
   max_buy_signals: 5
 
 portfolio:
