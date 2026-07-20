@@ -1,0 +1,51 @@
+name: Scheduled Stock Screener
+
+on:
+  schedule:
+    # Run at 3:30 AM UTC (9:00 AM IST) Monday through Friday
+    - cron: '30 3 * * 1-5'
+  workflow_dispatch:  # Allow manual trigger for testing
+
+permissions:
+  contents: read
+
+jobs:
+  scan-and-email:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run stock screener
+        run: python main.py --output-dir output
+        env:
+          PYTHONUNBUFFERED: '1'
+
+      - name: Send email report
+        run: python email_report.py
+        env:
+          EMAIL_SENDER: ${{ secrets.EMAIL_SENDER }}
+          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
+          EMAIL_RECIPIENTS: ${{ secrets.EMAIL_RECIPIENTS }}
+          SMTP_HOST: ${{ secrets.SMTP_HOST || 'smtp.gmail.com' }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT || '587' }}
+          OUTPUT_DIR: output
+
+      - name: Upload results artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: screener-results-${{ github.run_id }}
+          path: output/
+          retention-days: 30
