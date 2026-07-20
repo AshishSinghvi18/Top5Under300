@@ -80,10 +80,13 @@ Three artifacts per run:
 ```
 Top5Under300/
 ├── main.py            # Self-contained scanner — all logic inline, no src/ modules
+├── email_report.py    # Email notification module (HTML formatted reports)
 ├── config.yaml        # All thresholds (edit to tune)
 ├── nse_stocks.csv     # 90+ liquid NSE stocks under ₹300
 ├── sector_mapping.yaml
 ├── requirements.txt
+├── .github/workflows/
+│   └── scheduled_scan.yml  # Cron schedule: Mon-Fri 9 AM IST
 └── output/            # Created automatically per run
 ```
 
@@ -113,6 +116,56 @@ All free, no paid APIs required:
 - `pandas` / `numpy` — calculations
 - `rich` — colored console output
 - `pyyaml` — configuration loading
+
+## Automated Scheduling & Email Notifications
+
+The screener can run automatically **Monday–Friday at 9:00 AM IST** (before market opens) via GitHub Actions and send results to your email.
+
+### Setup
+
+1. **Configure GitHub Secrets** in your repository (`Settings → Secrets and variables → Actions`):
+
+   | Secret | Description | Example |
+   |--------|-------------|---------|
+   | `EMAIL_SENDER` | Sender Gmail address | `yourname@gmail.com` |
+   | `EMAIL_PASSWORD` | Gmail App Password (not your regular password) | `abcd efgh ijkl mnop` |
+   | `EMAIL_RECIPIENTS` | Comma-separated recipient emails | `you@gmail.com,friend@gmail.com` |
+   | `SMTP_HOST` | SMTP server (optional, default: `smtp.gmail.com`) | `smtp.gmail.com` |
+   | `SMTP_PORT` | SMTP port (optional, default: `587`) | `587` |
+
+2. **Generate a Gmail App Password**:
+   - Go to [Google Account → Security → App Passwords](https://myaccount.google.com/apppasswords)
+   - Select "Mail" and generate a 16-character app password
+   - Use this as `EMAIL_PASSWORD` (not your regular Gmail password)
+
+3. **Enable the workflow**: The workflow at `.github/workflows/scheduled_scan.yml` runs automatically on schedule. You can also trigger it manually from the Actions tab.
+
+### Manual trigger
+
+You can test the workflow anytime from GitHub → Actions → "Scheduled Stock Screener" → "Run workflow".
+
+### Email report
+
+The email includes:
+- Summary table of all shortlisted stocks
+- Detailed cards for each stock with entry, targets, stop loss, scores, and risk flags
+- Position sizing recommendations
+- Formatted HTML for easy reading on any device
+
+### Run email locally (for testing)
+
+```bash
+# Set environment variables
+export EMAIL_SENDER="your@gmail.com"
+export EMAIL_PASSWORD="your-app-password"
+export EMAIL_RECIPIENTS="recipient@gmail.com"
+
+# Run screener first
+python main.py
+
+# Send email with latest results
+python email_report.py
+```
 
 ## Known limitations
 
