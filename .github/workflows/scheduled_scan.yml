@@ -2,8 +2,10 @@ name: Scheduled Stock Screener
 
 on:
   schedule:
-    # Run at 3:30 AM UTC (9:00 AM IST) Monday through Friday
-    - cron: '30 3 * * 1-5'
+    # Run at 1:00 AM UTC (6:30 AM IST) Monday through Friday
+    # Scheduled early to account for GitHub Actions cron delays (~2-2.5 hrs)
+    # so actual execution is closer to 9:00 AM IST
+    - cron: '0 1 * * 1-5'
   workflow_dispatch:  # Allow manual trigger for testing
 
 permissions:
