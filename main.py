@@ -335,7 +335,13 @@ def fetch_stock_data(
 ) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     ticker = yf.Ticker(f"{symbol}.NS")
     try:
-        history = ticker.history(period="1y", auto_adjust=False)
+        # FIX #5 (price correctness): auto_adjust=True back-adjusts historical
+        # OHLC for splits/bonuses/dividends. With the old auto_adjust=False, any
+        # corporate action in the trailing year injects a false gap into the raw
+        # series, corrupting RSI/MACD/SMA/ATR for weeks around the ex-date. The
+        # MOST RECENT bar's adjustment factor is ~1.0, so the displayed current
+        # price stays the true last traded price; only history is rescaled.
+        history = ticker.history(period="1y", auto_adjust=True)
     except Exception as exc:
         raise ScanError(f"Yahoo Finance history fetch failed: {exc}") from exc
     if history is None or history.empty:
