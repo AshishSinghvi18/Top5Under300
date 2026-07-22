@@ -10,6 +10,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+from zoneinfo import ZoneInfo  # FIX #2: IST-aware incomplete-bar handling
 
 from dataclasses import asdict, dataclass, field
 
@@ -23,6 +24,12 @@ from rich.panel import Panel
 from rich.table import Table
 from rich import box
 from rich.text import Text
+
+# FIX #2: NSE regular session closes 15:30 IST. A daily bar dated "today" fetched
+# before this time is a partial/incomplete candle and must not drive signals.
+IST = ZoneInfo("Asia/Kolkata")
+MARKET_CLOSE_HOUR = 15
+MARKET_CLOSE_MINUTE = 30
 
 SECTOR_PE_FALLBACK = {
     "Financial Services": 15,
@@ -59,6 +66,13 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "max_debt_to_equity": 1.5,
         "min_roe": 0.10,
         "min_revenue_growth": 0.0,
+        # FIX #4 (optional knob): minimum fundamental checks that must pass.
+        # auto_pass_when_thin preserves the original behaviour: if Yahoo returns
+        # fewer than min_fundamental_pass usable fields, the stock passes on a
+        # risk-flag rather than being dropped. Set auto_pass_when_thin=false to
+        # require real fundamental confirmation instead.
+        "min_fundamental_pass": 2,
+        "auto_pass_when_thin": True,
     },
     "trade": {
         "atr_multiplier": 2.0,
@@ -70,6 +84,14 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "max_position_percent": 0.20,
         "min_sl_percent": 0.005,
         "max_sl_percent": 0.05,
+        # FIX #3: the 3-10% band is now an actual SELECTION filter, not a display
+        # clamp. A stock qualifies only if its expected N-session move (ATR-based)
+        # lands in [return_band_min, return_band_max]. Set enforce_return_band=false
+        # to revert to pure-momentum selection.
+        "return_band_min": 3.0,
+        "return_band_max": 10.0,
+        "enforce_return_band": True,
+        "expected_move_sessions": 2,
     },
     "scoring": {
         "max_buy_signals": 5,
@@ -106,6 +128,7 @@ class StockResult:
     rr3: float
     return_min: float
     return_max: float
+    expected_move_pct: float  # FIX #3: ATR-based N-session expected move used for band gate
     position_qty: int
     position_value: float
     validity_days: int
@@ -142,8 +165,9 @@ class StockResult:
             "Target1": round(self.target1, 2),
             "Target2": round(self.target2, 2),
             "Target3": round(self.target3, 2),
-            "ReturnMin": round(self.return_min, 2),
-            "ReturnMax": round(self.return_max, 2),
+            "ExpectedMovePct": round(self.expected_move_pct, 2),  # FIX #3
+            "ReturnToT1Pct": round(self.return_min, 2),
+            "ReturnToT3Pct": round(self.return_max, 2),
             "TriggerEvents": "; ".join(self.trigger_events),
             "RiskFlags": "; ".join(self.risk_flags),
         }
@@ -169,6 +193,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", default="output", help="Output directory")
     parser.add_argument("--verbose", action="store_true", help="Enable debug logging")
     parser.add_argument("--limit", type=int, default=None, help="Scan only the first N stocks")
+    parser.add_argument(
+        "--no-return-band",
+        action="store_true",
+        help="Disable the 3-10%% expected-move filter (revert to pure momentum selection)",
+    )
+    parser.add_argument(
+        "--keep-incomplete-bar",
+        action="store_true",
+        help="Do NOT drop today's partial bar (use only if you run against completed data)",
+    )
     return parser.parse_args()
 
 
@@ -209,6 +243,8 @@ def load_config(config_path: str, args: argparse.Namespace) -> Dict[str, Any]:
         config["screener"]["max_price"] = float(args.max_price)
     if args.portfolio is not None:
         config.setdefault("portfolio", {})["default_size"] = float(args.portfolio)
+    if getattr(args, "no_return_band", False):
+        config["trade"]["enforce_return_band"] = False
     config["screener"]["max_price"] = min(300.0, float(config["screener"]["max_price"]))
     return config
 
@@ -268,7 +304,35 @@ def rupees(value: float) -> str:
     return f"₹{value:,.2f}"
 
 
-def fetch_stock_data(symbol: str) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+def drop_incomplete_bar(history: pd.DataFrame) -> pd.DataFrame:
+    """FIX #2: Drop today's partial daily bar if the session has not yet closed.
+
+    Yahoo returns a live, still-forming candle for the current day while the
+    market is open. Every signal in this scanner reads df.iloc[-1], so leaving
+    that partial bar in place corrupts RSI, the MACD cross, the volume surge,
+    ATR and every candle pattern. This is the daily-timeframe analogue of the
+    intraday partial-bar problem. On weekends/holidays the last bar's date will
+    not equal today, so nothing is dropped.
+    """
+    if history is None or history.empty:
+        return history
+    now_ist = datetime.now(IST)
+    last_ts = pd.Timestamp(history.index[-1])
+    if last_ts.tzinfo is not None:
+        last_date = last_ts.tz_convert(IST).date()
+    else:
+        last_date = last_ts.date()
+    close_dt = now_ist.replace(
+        hour=MARKET_CLOSE_HOUR, minute=MARKET_CLOSE_MINUTE, second=0, microsecond=0
+    )
+    if last_date == now_ist.date() and now_ist < close_dt:
+        return history.iloc[:-1].copy()
+    return history
+
+
+def fetch_stock_data(
+    symbol: str, drop_partial: bool = True
+) -> Tuple[pd.DataFrame, Dict[str, Any]]:
     ticker = yf.Ticker(f"{symbol}.NS")
     try:
         history = ticker.history(period="1y", auto_adjust=False)
@@ -285,6 +349,10 @@ def fetch_stock_data(symbol: str) -> Tuple[pd.DataFrame, Dict[str, Any]]:
 
     history = history[required_cols].dropna().copy()
     history = history[history["Volume"] >= 0]
+
+    if drop_partial:  # FIX #2
+        history = drop_incomplete_bar(history)
+
     if len(history) < 60:
         raise ScanError("Insufficient history for indicator calculations")
 
@@ -475,7 +543,12 @@ def evaluate_layer3(info: Dict[str, Any], fallback_sector: str, config: Dict[str
     available_checks = sum(value is not None for value in conditions.values())
     pass_count = sum(value is True for value in conditions.values())
     score = round(sum(score_boolean_condition(value) for value in conditions.values()) / len(conditions), 2)
-    passed = pass_count >= 2 or available_checks < 2
+
+    # FIX #4 (optional knob): original behaviour was `pass_count >= 2 or available_checks < 2`,
+    # i.e. thin-data stocks auto-passed. That is preserved by default but now controllable.
+    min_pass = int(config["fundamental"].get("min_fundamental_pass", 2))
+    auto_pass_thin = bool(config["fundamental"].get("auto_pass_when_thin", True))
+    passed = pass_count >= min_pass or (auto_pass_thin and available_checks < min_pass)
 
     return {
         "passed": passed,
@@ -504,7 +577,7 @@ def score_atr_band(atr_pct: float) -> float:
     return 25.0
 
 
-def evaluate_layer4(df: pd.DataFrame, layer2: Dict[str, Any]) -> Dict[str, Any]:
+def evaluate_layer4(df: pd.DataFrame, layer2: Dict[str, Any], config: Dict[str, Any]) -> Dict[str, Any]:
     latest = df.iloc[-1]
     close = float(latest["Close"])
     atr = float(latest["ATR14"])
@@ -516,6 +589,18 @@ def evaluate_layer4(df: pd.DataFrame, layer2: Dict[str, Any]) -> Dict[str, Any]:
     bb_position = 0.5
     if bb_high > bb_low:
         bb_position = (close - bb_low) / (bb_high - bb_low)
+
+    # FIX #3: realistic expected move over the trade's validity horizon.
+    # sigma_N ≈ ATR * sqrt(N). This is what the 3-10% band now actually screens on.
+    sessions = int(
+        config["trade"].get(
+            "expected_move_sessions", config["trade"].get("validity_trading_days", 2)
+        )
+    )
+    expected_move_pct = (atr / close) * math.sqrt(max(1, sessions)) * 100 if close else 0.0
+    band_min = float(config["trade"].get("return_band_min", 3.0))
+    band_max = float(config["trade"].get("return_band_max", 10.0))
+    in_band = band_min <= expected_move_pct <= band_max
 
     atr_score = score_atr_band(atr_pct)
     return_score = clamp(50 + five_day_return * 8, 0, 100)
@@ -542,12 +627,18 @@ def evaluate_layer4(df: pd.DataFrame, layer2: Dict[str, Any]) -> Dict[str, Any]:
         triggers.append(f"10-day ROC positive ({roc10:.2f}%)")
     if 2.0 <= atr_pct <= 5.0:
         triggers.append(f"ATR in sweet spot ({atr_pct:.2f}% of price)")
+    triggers.append(f"Expected {sessions}-session move ~{expected_move_pct:.2f}%")
     triggers.append(bb_note)
 
     return {
         "score": setup_score,
         "atr": atr,
         "atr_pct": atr_pct,
+        "expected_move_pct": expected_move_pct,  # FIX #3
+        "in_band": in_band,  # FIX #3
+        "band_min": band_min,
+        "band_max": band_max,
+        "sessions": sessions,
         "five_day_return": five_day_return,
         "roc10": roc10,
         "bb_position": bb_position,
@@ -754,19 +845,29 @@ def compute_scores(layer2: Dict[str, Any], layer3: Dict[str, Any], layer4: Dict[
 
 
 def estimate_return_range(entry: float, target1: float, target3: float) -> Tuple[float, float]:
+    """FIX #1: report the TRUE return to target1 and target3, correctly ordered.
+
+    The previous implementation applied `max(3.0, r1)` / `min(10.0, r3)`, which
+    (a) floored the low end and capped the high end regardless of the actual
+    targets, producing inverted bands like '3.00%-1.75%' for low-volatility
+    names, and (b) silently hid real upside above 10%. The 3-10% intent is now
+    enforced upstream as a selection filter (expected-move band in Layer 4), so
+    this function does pure, honest reporting of the computed target returns.
+    """
     r1 = ((target1 - entry) / entry) * 100 if entry else 0.0
     r3 = ((target3 - entry) / entry) * 100 if entry else 0.0
-    return round(max(3.0, r1), 2), round(min(10.0, max(r1, r3)), 2)
+    lo, hi = sorted((round(r1, 2), round(r3, 2)))
+    return lo, hi
 
 
 def get_company_name(info: Dict[str, Any], symbol: str) -> str:
     return str(info.get("longName") or info.get("shortName") or symbol).strip()
 
 
-def scan_symbol(symbol_row: pd.Series, config: Dict[str, Any]) -> Optional[StockResult]:
+def scan_symbol(symbol_row: pd.Series, config: Dict[str, Any], drop_partial: bool = True) -> Optional[StockResult]:
     symbol = str(symbol_row["Symbol"])
     fallback_sector = str(symbol_row.get("Sector", "Default"))
-    history, info = fetch_stock_data(symbol)
+    history, info = fetch_stock_data(symbol, drop_partial=drop_partial)
     if len(history) < int(config["screener"].get("min_history_days", 200)):
         raise ScanError("Insufficient history to run 1-year momentum scan")
 
@@ -791,7 +892,20 @@ def scan_symbol(symbol_row: pd.Series, config: Dict[str, Any]) -> Optional[Stock
     if not layer3["passed"]:
         return None
 
-    layer4 = evaluate_layer4(history, layer2)
+    layer4 = evaluate_layer4(history, layer2, config)
+
+    # FIX #3: enforce the 3-10% expected-move band as an actual selection filter.
+    if bool(config["trade"].get("enforce_return_band", True)) and not layer4["in_band"]:
+        LOGGER.debug(
+            "%s skipped by return band: expected %d-session move=%.2f%% (band %.1f-%.1f%%)",
+            symbol,
+            layer4["sessions"],
+            layer4["expected_move_pct"],
+            layer4["band_min"],
+            layer4["band_max"],
+        )
+        return None
+
     layer5 = evaluate_layer5(history, layer2)
 
     latest = history.iloc[-1]
@@ -831,6 +945,7 @@ def scan_symbol(symbol_row: pd.Series, config: Dict[str, Any]) -> Optional[Stock
         rr3=round(trade["rr3"], 2),
         return_min=return_min,
         return_max=return_max,
+        expected_move_pct=round(layer4["expected_move_pct"], 2),  # FIX #3
         position_qty=position_qty,
         position_value=round(position_value, 2),
         validity_days=int(config["trade"]["validity_trading_days"]),
@@ -876,8 +991,9 @@ def save_results(results: List[StockResult], output_dir: Path, generated_at: dat
         "Target1",
         "Target2",
         "Target3",
-        "ReturnMin",
-        "ReturnMax",
+        "ExpectedMovePct",
+        "ReturnToT1Pct",
+        "ReturnToT3Pct",
         "TriggerEvents",
         "RiskFlags",
     ]
@@ -901,7 +1017,8 @@ def render_summary_table(results: List[StockResult]) -> None:
     table.add_column("Tech", justify="right")
     table.add_column("Fund", justify="right")
     table.add_column("Conf.", justify="right", style="bold green")
-    table.add_column("Return Potential", justify="right")
+    table.add_column("Exp. Move", justify="right")
+    table.add_column("Return to T1-T3", justify="right")
     table.add_column("Top Trigger")
 
     for index, result in enumerate(results, start=1):
@@ -914,6 +1031,7 @@ def render_summary_table(results: List[StockResult]) -> None:
             f"{result.technical_score:.1f}",
             f"{result.fundamental_score:.1f}",
             f"{result.confidence_score:.1f}",
+            f"{result.expected_move_pct:.1f}%",
             f"{result.return_min:.1f}%–{result.return_max:.1f}%",
             trigger,
         )
@@ -926,7 +1044,8 @@ def render_detail_card(result: StockResult, portfolio_size: float, risk_per_trad
     detail.add_column(style="white")
 
     detail.add_row("Stock Info", f"{result.symbol} | {result.company} | {rupees(result.current_price)} | {result.sector}")
-    detail.add_row("Return Potential", f"{result.return_min:.2f}% – {result.return_max:.2f}%")
+    detail.add_row("Expected Move (band gate)", f"{result.expected_move_pct:.2f}% over {result.validity_days} sessions")
+    detail.add_row("Return to Targets", f"T1 {result.return_min:.2f}% … T3 {result.return_max:.2f}%")
     detail.add_row("Trigger Events", ", ".join(result.trigger_events[:6]) or "None")
     detail.add_row("Entry Level", rupees(result.entry))
     detail.add_row("🎯 Target 1 (1.5:1)", f"{rupees(result.target1)} | R:R {result.rr1:.1f}:1")
@@ -950,8 +1069,10 @@ def render_detail_card(result: StockResult, portfolio_size: float, risk_per_trad
 
 def render_zero_state(output_dir: Path) -> None:
     message = (
-        "No stocks met all shortlist criteria in this run. This can happen when price, volume, trend, or fundamentals are weak. "
-        f"Try a smaller --limit for debugging or adjust config thresholds in {output_dir.parent / 'config.yaml' if output_dir.parent else 'config.yaml'}."
+        "No stocks met all shortlist criteria in this run. This can happen when price, volume, trend, "
+        "fundamentals, or the expected-move band are not satisfied. "
+        f"Try a smaller --limit for debugging, --no-return-band to relax the 3-10%% filter, "
+        f"or adjust config thresholds in {output_dir.parent / 'config.yaml' if output_dir.parent else 'config.yaml'}."
     )
     CONSOLE.print(Panel(message, title="No Qualified Stocks", border_style="red", box=box.ROUNDED))
 
@@ -961,14 +1082,18 @@ def main() -> int:
     configure_logging(args.verbose)
     config = load_config(args.config, args)
     generated_at = datetime.now()
+    drop_partial = not getattr(args, "keep_incomplete_bar", False)  # FIX #2
 
     print_disclaimer()
     universe_path = Path("nse_stocks.csv")
     universe = load_universe(universe_path, args.limit)
     CONSOLE.print(f"[bold cyan]Universe loaded:[/bold cyan] {len(universe)} stocks")
+    band_state = "ON" if config["trade"].get("enforce_return_band", True) else "OFF"
     CONSOLE.print(
         f"[bold cyan]Scan filters:[/bold cyan] ₹{config['screener']['min_price']:.0f} to ₹{config['screener']['max_price']:.0f}, "
-        f"20D avg volume > {int(config['screener']['min_avg_volume_20d']):,}"
+        f"20D avg volume > {int(config['screener']['min_avg_volume_20d']):,} | "
+        f"return band {config['trade']['return_band_min']:.0f}-{config['trade']['return_band_max']:.0f}% [{band_state}] | "
+        f"partial-bar drop {'ON' if drop_partial else 'OFF'}"
     )
 
     results: List[StockResult] = []
@@ -980,14 +1105,15 @@ def main() -> int:
         symbol = str(row["Symbol"])
         CONSOLE.print(f"[blue]Scanning {index}/{len(universe)}:[/blue] {symbol}")
         try:
-            result = scan_symbol(row, config)
+            result = scan_symbol(row, config, drop_partial=drop_partial)
             if result is not None:
                 results.append(result)
                 LOGGER.info(
-                    "%s shortlisted | price=%s | confidence=%.2f",
+                    "%s shortlisted | price=%s | confidence=%.2f | exp_move=%.2f%%",
                     result.symbol,
                     result.current_price,
                     result.confidence_score,
+                    result.expected_move_pct,
                 )
         except KeyboardInterrupt:
             raise
