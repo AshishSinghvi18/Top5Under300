@@ -1,12 +1,11 @@
 name: Scheduled Stock Screener
 
 on:
-  repository_dispatch:
-    types: [run-screener]  # Triggered by external cron service (cron-job.org)
   schedule:
-    # Run at 1:00 AM UTC (6:30 AM IST) Monday through Friday (backup)
-    # Kept as fallback in case external cron service is unavailable
-    - cron: '0 1 * * 1-5'
+    # Run at 1:00 AM IST (7:30 PM UTC previous day) Monday through Friday
+    # IST = UTC + 5:30, so 1:00 AM IST = 19:30 UTC previous day
+    # Days: Sun-Thu UTC correspond to Mon-Fri IST nights
+    - cron: '30 19 * * 0-4'
   workflow_dispatch:  # Allow manual trigger for testing
 
 permissions:
