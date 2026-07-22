@@ -141,7 +141,7 @@ For reliable 9:00 AM IST execution, use an external cron service to trigger the 
    - Token name: `cron-trigger-top5under300`
    - Expiration: 1 year
    - Repository access: "Only select repositories" → `Top5Under300`
-   - Permissions: **Actions** = Read and write, **Contents** = Read
+   - Permissions: **Actions** = Read and write, **Contents** = Read and write
    - Generate and copy the token
 
 2. **Sign up on [cron-job.org](https://cron-job.org)** (free) and create a new cron job:
