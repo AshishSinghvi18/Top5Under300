@@ -1,10 +1,11 @@
 name: Scheduled Stock Screener
 
 on:
+  repository_dispatch:
+    types: [run-screener]  # Triggered by external cron service (cron-job.org)
   schedule:
-    # Run at 1:00 AM UTC (6:30 AM IST) Monday through Friday
-    # Scheduled early to account for GitHub Actions cron delays (~2-2.5 hrs)
-    # so actual execution is closer to 9:00 AM IST
+    # Run at 1:00 AM UTC (6:30 AM IST) Monday through Friday (backup)
+    # Kept as fallback in case external cron service is unavailable
     - cron: '0 1 * * 1-5'
   workflow_dispatch:  # Allow manual trigger for testing
 

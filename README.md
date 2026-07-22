@@ -119,9 +119,55 @@ All free, no paid APIs required:
 
 ## Automated Scheduling & Email Notifications
 
-The screener can run automatically **Monday–Friday at 9:00 AM IST** (before market opens) via GitHub Actions and send results to your email.
+The screener runs automatically **Monday–Friday at 9:00 AM IST** (before market opens) via GitHub Actions and sends results to your email.
 
-### Setup
+### Trigger Methods
+
+The workflow supports three trigger methods:
+
+| Method | Trigger | Reliability |
+|--------|---------|-------------|
+| **External cron** (recommended) | `repository_dispatch` via cron-job.org | ⭐ High — fires within seconds |
+| **GitHub schedule** (backup) | Built-in cron `0 1 * * 1-5` UTC | Medium — can delay 1-4 hours |
+| **Manual** | `workflow_dispatch` from Actions tab | On-demand |
+
+### Setting Up External Cron (Recommended)
+
+For reliable 9:00 AM IST execution, use an external cron service to trigger the workflow:
+
+1. **Create a GitHub Personal Access Token (PAT)**:
+   - Go to GitHub → Settings → Developer settings → Personal access tokens → Fine-grained tokens
+   - Click "Generate new token"
+   - Token name: `cron-trigger-top5under300`
+   - Expiration: 1 year
+   - Repository access: "Only select repositories" → `Top5Under300`
+   - Permissions: **Actions** = Read and write, **Contents** = Read
+   - Generate and copy the token
+
+2. **Sign up on [cron-job.org](https://cron-job.org)** (free) and create a new cron job:
+
+   | Field | Value |
+   |-------|-------|
+   | Title | `Top5Under300 Morning Trigger` |
+   | URL | `https://api.github.com/repos/AshishSinghvi18/Top5Under300/dispatches` |
+   | Schedule | 3:30 AM UTC, Monday–Friday |
+   | Method | POST |
+
+   **Headers:**
+   ```
+   Authorization: ******
+   Accept: application/vnd.github+json
+   Content-Type: application/json
+   ```
+
+   **Request Body:**
+   ```json
+   {"event_type": "run-screener"}
+   ```
+
+3. **Test it**: Click "Test run" on cron-job.org, then check GitHub → Actions for a new run.
+
+### Email Setup
 
 1. **Configure GitHub Secrets** in your repository (`Settings → Secrets and variables → Actions`):
 
