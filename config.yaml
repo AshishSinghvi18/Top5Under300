@@ -31,7 +31,7 @@ technical:
   supertrend_fresh_flip_volume_multiplier: 1.5
   adx_period: 14
   adx_threshold: 25
-  min_technical_conditions: 4
+  min_technical_conditions: 3
 
 fundamental:
   max_pe_multiplier: 1.2

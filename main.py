@@ -49,7 +49,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "technical": {
         "rsi_lower": 50,
         "rsi_upper": 70,
-        "min_technical_conditions": 4,
+        "min_technical_conditions": 3,
         "volume_surge_multiplier": 1.5,
         "adx_threshold": 25,
         "macd_crossover_lookback": 5,
