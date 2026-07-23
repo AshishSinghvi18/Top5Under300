@@ -203,6 +203,14 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Do NOT drop today's partial bar (use only if you run against completed data)",
     )
+    parser.add_argument(
+        "--check-prices",
+        nargs="*",
+        default=None,
+        metavar="SYMBOL",
+        help="Verify prior-close vs today's open vs live price for the given symbols, then exit. "
+             "Runs NO scan. Example: --check-prices IRFC NHPC SUZLON",
+    )
     return parser.parse_args()
 
 
@@ -1083,9 +1091,62 @@ def render_zero_state(output_dir: Path) -> None:
     CONSOLE.print(Panel(message, title="No Qualified Stocks", border_style="red", box=box.ROUNDED))
 
 
+def run_price_check(symbols: List[str]) -> int:
+    """Verify what the screener's 'Entry' means vs the live market, for given symbols.
+
+    Entry = prior completed close. It differs from today's open by the overnight
+    gap, which is expected, not a data error. Prices here are fetched with
+    auto_adjust=False so they match a broker's raw quotes (the scan itself uses
+    auto_adjust=True for continuous indicators; see FIX #5).
+    """
+    symbols = [s.strip().upper().replace(".NS", "") for s in symbols] or ["IRFC", "NHPC", "SUZLON"]
+    CONSOLE.print(f"[bold cyan]Price check at[/bold cyan] {datetime.now(IST).strftime('%Y-%m-%d %H:%M IST')}")
+    CONSOLE.print("Entry = prior close; it differs from today's open by the overnight gap (expected).\n")
+    for symbol in symbols:
+        ticker = yf.Ticker(f"{symbol}.NS")
+        try:
+            hist = ticker.history(period="5d", auto_adjust=False)
+        except Exception as exc:
+            CONSOLE.print(f"{symbol:12s}  [red]FETCH FAILED[/red]: {exc}")
+            continue
+        if hist is None or hist.empty:
+            CONSOLE.print(
+                f"{symbol:12s}  [yellow]NO DATA[/yellow] "
+                f"(symbol may be renamed/delisted -- e.g. ZOMATO is now ETERNAL)"
+            )
+            continue
+        last_date = hist.index[-1].date()
+        today = datetime.now(IST).date()
+        try:
+            live = float(ticker.fast_info["last_price"])
+        except Exception:
+            live = float(hist["Close"].iloc[-1])
+        if last_date == today and len(hist) >= 2:
+            prior_close = float(hist["Close"].iloc[-2])   # = screener 'Entry'
+            todays_open = float(hist["Open"].iloc[-1])
+        else:
+            prior_close = float(hist["Close"].iloc[-1])
+            todays_open = None
+        line = f"{symbol:12s}  prior_close(=Entry)={prior_close:9.2f}"
+        if todays_open is not None:
+            gap = (todays_open - prior_close) / prior_close * 100
+            line += f"  today_open={todays_open:9.2f}  gap={gap:+6.2f}%"
+        else:
+            line += f"  today_open={'(not open yet)':>14s}          "
+        line += f"  live={live:9.2f}"
+        CONSOLE.print(line)
+    CONSOLE.print(
+        "\nIf 'live' matches your broker and 'gap' explains the difference, the price is correct: "
+        "the screener reports the prior close, not today's open."
+    )
+    return 0
+
+
 def main() -> int:
     args = parse_args()
     configure_logging(args.verbose)
+    if getattr(args, "check_prices", None) is not None:   # price-check mode: no scan
+        return run_price_check(args.check_prices)
     config = load_config(args.config, args)
     generated_at = datetime.now()
     drop_partial = not getattr(args, "keep_incomplete_bar", False)  # FIX #2
