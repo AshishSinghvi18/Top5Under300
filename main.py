@@ -51,6 +51,10 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "min_price": 50.0,
         "max_price": 300.0,
         "min_avg_volume_20d": 100000,
+        # MOD B: liquidity gate is now median 20-day TURNOVER in rupees, not a raw
+        # share count. 100k shares means ₹50L at ₹50 but ₹3cr at ₹300 -- turnover is
+        # the honest liquidity measure. Default ₹5 crore median daily turnover.
+        "min_turnover_inr": 50000000.0,
         "min_history_days": 200,
     },
     "technical": {
@@ -84,14 +88,35 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "max_position_percent": 0.20,
         "min_sl_percent": 0.005,
         "max_sl_percent": 0.05,
-        # FIX #3: the 3-10% band is now an actual SELECTION filter, not a display
-        # clamp. A stock qualifies only if its expected N-session move (ATR-based)
-        # lands in [return_band_min, return_band_max]. Set enforce_return_band=false
-        # to revert to pure-momentum selection.
+        # FIX #3: the 3-10% band is a SELECTION filter (not a display clamp). A stock
+        # qualifies only if its expected N-session move lands in the band.
         "return_band_min": 3.0,
         "return_band_max": 10.0,
         "enforce_return_band": True,
         "expected_move_sessions": 2,
+        # MOD E: how the expected move is estimated. "realized" uses the empirical
+        # std of overlapping N-session returns (measures the ACTUAL typical swing),
+        # which is more honest than "atr" (ATR x sqrt(N)), whose random-walk
+        # sqrt-time assumption understates fat-tailed momentum names. Falls back to
+        # ATR if history is too short.
+        "expected_move_method": "realized",
+    },
+    # MOD A: market-regime gate. Single-stock momentum is dominated by market beta
+    # on any given day, so flagging longs while the broad index is falling produces
+    # exactly the "all picks down together" outcome. When risk-off, the scan emits
+    # NO long signals. Disable with --no-regime.
+    "regime": {
+        "enabled": True,
+        "index_symbol": "^NSEI",   # Nifty 50
+        "ma_fast": 20,
+        "ma_slow": 50,
+    },
+    # MOD D: round-trip cost estimate netted off the displayed target returns, so the
+    # numbers reflect what actually lands in the account. Lumped percentage covering
+    # brokerage + STT + exchange + GST + stamp + slippage. This is an ESTIMATE; tune
+    # to your broker. On a 2-day sub-₹300 trade these costs are not negligible.
+    "costs": {
+        "round_trip_pct": 0.45,
     },
     "scoring": {
         "max_buy_signals": 5,
@@ -102,6 +127,8 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "default_size": 100000,
     },
 }
+
+STRATEGY_VERSION = "2.0"  # MOD F: bump when selection logic changes; resets your observation clock
 
 LOGGER = logging.getLogger("nse_scanner")
 CONSOLE = Console()
@@ -128,11 +155,15 @@ class StockResult:
     rr3: float
     return_min: float
     return_max: float
-    expected_move_pct: float  # FIX #3: ATR-based N-session expected move used for band gate
+    net_return_min: float   # MOD D: return to T1 after round-trip costs
+    net_return_max: float   # MOD D: return to T3 after round-trip costs
+    expected_move_pct: float  # FIX #3 / MOD E: expected N-session move used for band gate
+    expected_move_method: str  # MOD E: "realized" or "atr"
     position_qty: int
     position_value: float
     validity_days: int
     avg_volume_20d: float
+    turnover_inr_20d: float  # MOD B: median 20-day rupee turnover
     atr: float
     atr_pct: float
     rsi: float
@@ -165,9 +196,13 @@ class StockResult:
             "Target1": round(self.target1, 2),
             "Target2": round(self.target2, 2),
             "Target3": round(self.target3, 2),
-            "ExpectedMovePct": round(self.expected_move_pct, 2),  # FIX #3
+            "ExpectedMovePct": round(self.expected_move_pct, 2),  # FIX #3 / MOD E
+            "ExpMoveMethod": self.expected_move_method,
             "ReturnToT1Pct": round(self.return_min, 2),
             "ReturnToT3Pct": round(self.return_max, 2),
+            "NetReturnToT1Pct": round(self.net_return_min, 2),   # MOD D: after costs
+            "NetReturnToT3Pct": round(self.net_return_max, 2),   # MOD D: after costs
+            "Turnover20dINR": round(self.turnover_inr_20d, 0),   # MOD B
             "TriggerEvents": "; ".join(self.trigger_events),
             "RiskFlags": "; ".join(self.risk_flags),
         }
@@ -197,6 +232,11 @@ def parse_args() -> argparse.Namespace:
         "--no-return-band",
         action="store_true",
         help="Disable the 3-10%% expected-move filter (revert to pure momentum selection)",
+    )
+    parser.add_argument(
+        "--no-regime",
+        action="store_true",
+        help="Disable the market-regime gate (scan even when the Nifty is risk-off)",
     )
     parser.add_argument(
         "--keep-incomplete-bar",
@@ -253,6 +293,8 @@ def load_config(config_path: str, args: argparse.Namespace) -> Dict[str, Any]:
         config.setdefault("portfolio", {})["default_size"] = float(args.portfolio)
     if getattr(args, "no_return_band", False):
         config["trade"]["enforce_return_band"] = False
+    if getattr(args, "no_regime", False):
+        config.setdefault("regime", {})["enabled"] = False
     config["screener"]["max_price"] = min(300.0, float(config["screener"]["max_price"]))
     return config
 
@@ -379,6 +421,40 @@ def fetch_stock_data(
     return history, info
 
 
+def fetch_regime_state(config: Dict[str, Any], drop_partial: bool = True) -> Dict[str, Any]:
+    """MOD A: assess broad-market regime from the index (default Nifty 50).
+
+    Risk-on = index close > slow SMA AND fast SMA > slow SMA. When risk-off, the
+    scan emits no long signals -- this is the guard against flagging longs into a
+    falling market (the 'all picks down together' failure). On fetch failure it
+    fails OPEN (risk_on=True) but flags that the check could not run, so a data
+    outage never silently blocks every signal.
+    """
+    reg = config.get("regime", {})
+    symbol = str(reg.get("index_symbol", "^NSEI"))
+    fast = int(reg.get("ma_fast", 20))
+    slow = int(reg.get("ma_slow", 50))
+    try:
+        hist = yf.Ticker(symbol).history(period="6mo", auto_adjust=True)
+        hist = hist.rename(columns=str.title)[["Close"]].dropna()
+        if drop_partial:
+            hist = drop_incomplete_bar(hist)
+        if len(hist) < slow + 1:
+            return {"risk_on": True, "available": False,
+                    "detail": f"insufficient {symbol} history; regime check skipped"}
+        close = float(hist["Close"].iloc[-1])
+        sma_fast = float(hist["Close"].rolling(fast).mean().iloc[-1])
+        sma_slow = float(hist["Close"].rolling(slow).mean().iloc[-1])
+        risk_on = bool(close > sma_slow and sma_fast > sma_slow)
+        detail = (f"{symbol} {close:.0f} vs SMA{fast} {sma_fast:.0f} / SMA{slow} {sma_slow:.0f} -> "
+                  f"{'RISK-ON' if risk_on else 'RISK-OFF'}")
+        return {"risk_on": risk_on, "available": True, "detail": detail,
+                "close": close, "sma_fast": sma_fast, "sma_slow": sma_slow}
+    except Exception as exc:
+        return {"risk_on": True, "available": False,
+                "detail": f"{symbol} regime fetch failed ({exc}); proceeding risk-on"}
+
+
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     enriched = df.copy()
     enriched["RSI14"] = ta.momentum.RSIIndicator(close=enriched["Close"], window=14).rsi()
@@ -391,6 +467,12 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     enriched["SMA20"] = enriched["Close"].rolling(20).mean()
     enriched["SMA50"] = enriched["Close"].rolling(50).mean()
     enriched["VOL20"] = enriched["Volume"].rolling(20).mean()
+    # MOD C: average of the PRIOR 20 bars, excluding the current bar, so a volume
+    # "surge" is measured against history rather than partly against itself.
+    enriched["VOL20_PRIOR"] = enriched["Volume"].shift(1).rolling(20).mean()
+    # MOD B: rupee turnover per bar (price x volume) for a real liquidity measure.
+    enriched["TURNOVER"] = enriched["Close"] * enriched["Volume"]
+    enriched["TURNOVER20_MED"] = enriched["TURNOVER"].rolling(20).median()
 
     enriched["ADX14"] = ta.trend.ADXIndicator(
         high=enriched["High"],
@@ -458,14 +540,19 @@ def evaluate_layer1(df: pd.DataFrame, config: Dict[str, Any]) -> Dict[str, Any]:
     latest = df.iloc[-1]
     price = float(latest["Close"])
     avg_volume_20d = float(df["Volume"].rolling(20).mean().iloc[-1])
+    # MOD B: primary liquidity gate is median 20-day rupee turnover.
+    turnover_20d = float((df["Close"] * df["Volume"]).rolling(20).median().iloc[-1])
+    min_turnover = float(config["screener"].get("min_turnover_inr", 0.0))
     passed = (
         config["screener"]["min_price"] <= price <= config["screener"]["max_price"]
+        and turnover_20d >= min_turnover
         and avg_volume_20d > float(config["screener"]["min_avg_volume_20d"])
     )
     return {
         "passed": passed,
         "price": price,
         "avg_volume_20d": avg_volume_20d,
+        "turnover_20d": turnover_20d,
     }
 
 
@@ -477,6 +564,7 @@ def evaluate_layer2(df: pd.DataFrame, config: Dict[str, Any]) -> Dict[str, Any]:
     volume_multiplier = float(config["technical"]["volume_surge_multiplier"])
     adx_threshold = float(config["technical"]["adx_threshold"])
 
+    vol_ref = latest["VOL20_PRIOR"] if pd.notna(latest.get("VOL20_PRIOR")) else latest["VOL20"]
     conditions = {
         "RSI 50-70 bullish zone": rsi_lower <= float(latest["RSI14"]) <= rsi_upper,
         "MACD bullish crossover within 5 days": bool(
@@ -485,8 +573,9 @@ def evaluate_layer2(df: pd.DataFrame, config: Dict[str, Any]) -> Dict[str, Any]:
         "Price above SMA20 and SMA20 above SMA50": bool(
             latest["Close"] > latest["SMA20"] > latest["SMA50"]
         ),
+        # MOD C: compare against the prior-20-bar average, not one that includes today.
         "Volume surge above 1.5x 20D average": bool(
-            latest["Volume"] > volume_multiplier * latest["VOL20"]
+            latest["Volume"] > volume_multiplier * float(vol_ref)
         ),
         "ADX above 25": bool(latest["ADX14"] > adx_threshold),
     }
@@ -604,14 +693,28 @@ def evaluate_layer4(df: pd.DataFrame, layer2: Dict[str, Any], config: Dict[str, 
     if bb_high > bb_low:
         bb_position = (close - bb_low) / (bb_high - bb_low)
 
-    # FIX #3: realistic expected move over the trade's validity horizon.
-    # sigma_N ≈ ATR * sqrt(N). This is what the 3-10% band now actually screens on.
+    # FIX #3 / MOD E: expected move over the trade's validity horizon = the band gate.
     sessions = int(
         config["trade"].get(
             "expected_move_sessions", config["trade"].get("validity_trading_days", 2)
         )
     )
-    expected_move_pct = (atr / close) * math.sqrt(max(1, sessions)) * 100 if close else 0.0
+    method = str(config["trade"].get("expected_move_method", "realized")).lower()
+    atr_move_pct = (atr / close) * math.sqrt(max(1, sessions)) * 100 if close else 0.0
+    expected_move_method = "atr"
+    expected_move_pct = atr_move_pct
+    if method == "realized":
+        # Empirical std of overlapping N-session returns over the trailing ~90 bars.
+        # This measures the ACTUAL typical swing instead of assuming random-walk
+        # sqrt-time scaling, which understates fat-tailed momentum names.
+        nday = df["Close"].pct_change(sessions).dropna()
+        window = nday.iloc[-90:] if len(nday) >= 30 else nday
+        if len(window) >= 20:
+            realized = float(window.std() * 100)
+            if realized > 0 and math.isfinite(realized):
+                expected_move_pct = realized
+                expected_move_method = "realized"
+        # else: keep ATR fallback (expected_move_method stays "atr")
     band_min = float(config["trade"].get("return_band_min", 3.0))
     band_max = float(config["trade"].get("return_band_max", 10.0))
     in_band = band_min <= expected_move_pct <= band_max
@@ -641,14 +744,15 @@ def evaluate_layer4(df: pd.DataFrame, layer2: Dict[str, Any], config: Dict[str, 
         triggers.append(f"10-day ROC positive ({roc10:.2f}%)")
     if 2.0 <= atr_pct <= 5.0:
         triggers.append(f"ATR in sweet spot ({atr_pct:.2f}% of price)")
-    triggers.append(f"Expected {sessions}-session move ~{expected_move_pct:.2f}%")
+    triggers.append(f"Expected {sessions}-session move ~{expected_move_pct:.2f}% ({expected_move_method})")
     triggers.append(bb_note)
 
     return {
         "score": setup_score,
         "atr": atr,
         "atr_pct": atr_pct,
-        "expected_move_pct": expected_move_pct,  # FIX #3
+        "expected_move_pct": expected_move_pct,  # FIX #3 / MOD E
+        "expected_move_method": expected_move_method,  # MOD E
         "in_band": in_band,  # FIX #3
         "band_min": band_min,
         "band_max": band_max,
@@ -928,6 +1032,10 @@ def scan_symbol(symbol_row: pd.Series, config: Dict[str, Any], drop_partial: boo
     position_qty, position_value = compute_position_size(trade["entry"], trade["risk_per_share"], config)
     risk_flags = build_risk_flags(history, layer3, layer4, layer5)
     return_min, return_max = estimate_return_range(trade["entry"], trade["target1"], trade["target3"])
+    # MOD D: subtract a round-trip cost estimate so the displayed return is net.
+    round_trip_pct = float(config.get("costs", {}).get("round_trip_pct", 0.0))
+    net_return_min = round(return_min - round_trip_pct, 2)
+    net_return_max = round(return_max - round_trip_pct, 2)
 
     trigger_events = []
     trigger_events.extend(layer2["triggers"])
@@ -959,11 +1067,15 @@ def scan_symbol(symbol_row: pd.Series, config: Dict[str, Any], drop_partial: boo
         rr3=round(trade["rr3"], 2),
         return_min=return_min,
         return_max=return_max,
-        expected_move_pct=round(layer4["expected_move_pct"], 2),  # FIX #3
+        net_return_min=net_return_min,   # MOD D
+        net_return_max=net_return_max,   # MOD D
+        expected_move_pct=round(layer4["expected_move_pct"], 2),  # FIX #3 / MOD E
+        expected_move_method=layer4["expected_move_method"],      # MOD E
         position_qty=position_qty,
         position_value=round(position_value, 2),
         validity_days=int(config["trade"]["validity_trading_days"]),
         avg_volume_20d=round(layer1["avg_volume_20d"], 2),
+        turnover_inr_20d=round(layer1.get("turnover_20d", 0.0), 2),  # MOD B
         atr=round(layer4["atr"], 2),
         atr_pct=round(layer4["atr_pct"], 2),
         rsi=round(float(latest["RSI14"]), 2),
@@ -1006,8 +1118,12 @@ def save_results(results: List[StockResult], output_dir: Path, generated_at: dat
         "Target2",
         "Target3",
         "ExpectedMovePct",
+        "ExpMoveMethod",
         "ReturnToT1Pct",
         "ReturnToT3Pct",
+        "NetReturnToT1Pct",
+        "NetReturnToT3Pct",
+        "Turnover20dINR",
         "TriggerEvents",
         "RiskFlags",
     ]
@@ -1032,7 +1148,7 @@ def render_summary_table(results: List[StockResult]) -> None:
     table.add_column("Fund", justify="right")
     table.add_column("Conf.", justify="right", style="bold green")
     table.add_column("Exp. Move", justify="right")
-    table.add_column("Return to T1-T3", justify="right")
+    table.add_column("Net Ret T1-T3", justify="right")
     table.add_column("Top Trigger")
 
     for index, result in enumerate(results, start=1):
@@ -1046,7 +1162,7 @@ def render_summary_table(results: List[StockResult]) -> None:
             f"{result.fundamental_score:.1f}",
             f"{result.confidence_score:.1f}",
             f"{result.expected_move_pct:.1f}%",
-            f"{result.return_min:.1f}%–{result.return_max:.1f}%",
+            f"{result.net_return_min:.1f}%–{result.net_return_max:.1f}%",
             trigger,
         )
     CONSOLE.print(table)
@@ -1058,8 +1174,9 @@ def render_detail_card(result: StockResult, portfolio_size: float, risk_per_trad
     detail.add_column(style="white")
 
     detail.add_row("Stock Info", f"{result.symbol} | {result.company} | {rupees(result.current_price)} | {result.sector}")
-    detail.add_row("Expected Move (band gate)", f"{result.expected_move_pct:.2f}% over {result.validity_days} sessions")
-    detail.add_row("Return to Targets", f"T1 {result.return_min:.2f}% … T3 {result.return_max:.2f}%")
+    detail.add_row("Expected Move (band gate)", f"{result.expected_move_pct:.2f}% over {result.validity_days} sessions ({result.expected_move_method})")
+    detail.add_row("Return to Targets (gross)", f"T1 {result.return_min:.2f}% … T3 {result.return_max:.2f}%")
+    detail.add_row("Return to Targets (net of costs)", f"T1 {result.net_return_min:.2f}% … T3 {result.net_return_max:.2f}%")
     detail.add_row("Trigger Events", ", ".join(result.trigger_events[:6]) or "None")
     detail.add_row("Entry Level", rupees(result.entry))
     detail.add_row("🎯 Target 1 (1.5:1)", f"{rupees(result.target1)} | R:R {result.rr1:.1f}:1")
@@ -1154,14 +1271,33 @@ def main() -> int:
     print_disclaimer()
     universe_path = Path("nse_stocks.csv")
     universe = load_universe(universe_path, args.limit)
-    CONSOLE.print(f"[bold cyan]Universe loaded:[/bold cyan] {len(universe)} stocks")
+    CONSOLE.print(f"[bold cyan]Universe loaded:[/bold cyan] {len(universe)} stocks  "
+                  f"[dim](strategy v{STRATEGY_VERSION})[/dim]")
     band_state = "ON" if config["trade"].get("enforce_return_band", True) else "OFF"
+    regime_enabled = bool(config.get("regime", {}).get("enabled", True))
     CONSOLE.print(
         f"[bold cyan]Scan filters:[/bold cyan] ₹{config['screener']['min_price']:.0f} to ₹{config['screener']['max_price']:.0f}, "
-        f"20D avg volume > {int(config['screener']['min_avg_volume_20d']):,} | "
+        f"20D turnover > ₹{config['screener'].get('min_turnover_inr', 0)/1e7:.1f}cr | "
         f"return band {config['trade']['return_band_min']:.0f}-{config['trade']['return_band_max']:.0f}% [{band_state}] | "
+        f"regime gate [{'ON' if regime_enabled else 'OFF'}] | "
         f"partial-bar drop {'ON' if drop_partial else 'OFF'}"
     )
+
+    # MOD A: market-regime gate -- assessed once, before scanning any stock.
+    if regime_enabled:
+        regime = fetch_regime_state(config, drop_partial=drop_partial)
+        CONSOLE.print(f"[bold cyan]Market regime:[/bold cyan] {regime['detail']}")
+        if not regime["risk_on"]:
+            output_dir = Path(args.output_dir)
+            save_results([], output_dir, generated_at)
+            CONSOLE.print(Panel(
+                "Broad market is RISK-OFF, so no long signals are emitted today. "
+                "This is deliberate: single-stock momentum is dominated by market direction, "
+                "and buying longs into a falling index is how every pick ends up red together. "
+                "Re-run with --no-regime to override.",
+                title="No signals (regime risk-off)", border_style="yellow", box=box.ROUNDED,
+            ))
+            return 0
 
     results: List[StockResult] = []
     start_time = time.time()
