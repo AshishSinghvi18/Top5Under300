@@ -111,6 +111,20 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "ma_fast": 20,
         "ma_slow": 50,
     },
+    # MOD G: event / announcement gate. Two parts, because reliable NSE event data
+    # does NOT come from Yahoo:
+    #   1) earnings/corporate-action proximity from yfinance (best-effort, FAILS OPEN
+    #      when data is missing -- yfinance's NSE calendar is patchy);
+    #   2) a surveillance/ban EXCLUSION LIST you maintain from NSE's official daily
+    #      files (ASM/GSM, F&O ban, trade-to-trade). This is the dependable half.
+    # Populate exclusion_file with one symbol per line (no .NS). Path is relative to
+    # the working directory. Disable the whole gate with --no-events.
+    "events": {
+        "enabled": True,
+        "earnings_blackout_days": 3,
+        "corp_action_blackout_days": 2,
+        "exclusion_file": "exclude_symbols.csv",
+    },
     # MOD D: round-trip cost estimate netted off the displayed target returns, so the
     # numbers reflect what actually lands in the account. Lumped percentage covering
     # brokerage + STT + exchange + GST + stamp + slippage. This is an ESTIMATE; tune
@@ -128,7 +142,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     },
 }
 
-STRATEGY_VERSION = "2.0"  # MOD F: bump when selection logic changes; resets your observation clock
+STRATEGY_VERSION = "2.1"  # MOD F: bump when selection logic changes; resets your observation clock
 
 LOGGER = logging.getLogger("nse_scanner")
 CONSOLE = Console()
@@ -239,6 +253,11 @@ def parse_args() -> argparse.Namespace:
         help="Disable the market-regime gate (scan even when the Nifty is risk-off)",
     )
     parser.add_argument(
+        "--no-events",
+        action="store_true",
+        help="Disable the event gate (earnings/ex-date proximity + surveillance exclusion list)",
+    )
+    parser.add_argument(
         "--keep-incomplete-bar",
         action="store_true",
         help="Do NOT drop today's partial bar (use only if you run against completed data)",
@@ -295,6 +314,8 @@ def load_config(config_path: str, args: argparse.Namespace) -> Dict[str, Any]:
         config["trade"]["enforce_return_band"] = False
     if getattr(args, "no_regime", False):
         config.setdefault("regime", {})["enabled"] = False
+    if getattr(args, "no_events", False):
+        config.setdefault("events", {})["enabled"] = False
     config["screener"]["max_price"] = min(300.0, float(config["screener"]["max_price"]))
     return config
 
@@ -453,6 +474,71 @@ def fetch_regime_state(config: Dict[str, Any], drop_partial: bool = True) -> Dic
     except Exception as exc:
         return {"risk_on": True, "available": False,
                 "detail": f"{symbol} regime fetch failed ({exc}); proceeding risk-on"}
+
+
+def load_exclusion_set(config: Dict[str, Any]) -> set:
+    """MOD G: load a symbol exclusion list (NSE ASM/GSM, F&O ban, trade-to-trade).
+
+    You populate this from NSE's official daily files -- Yahoo does not carry it.
+    One symbol per line (no .NS); blank lines and '#' comments ignored. Missing
+    file is fine (returns empty set) but means the surveillance gate is inactive.
+    """
+    path = Path(str(config.get("events", {}).get("exclusion_file", "")))
+    if not path or not path.exists():
+        return set()
+    out = set()
+    for line in path.read_text(encoding="utf-8").splitlines():
+        s = line.strip().upper().replace(".NS", "")
+        if s and not s.startswith("#"):
+            out.add(s)
+    return out
+
+
+def check_event_blackout(symbol: str, config: Dict[str, Any], exclusion_set: set) -> Tuple[bool, str]:
+    """MOD G: return (blocked, reason) for the event/announcement gate.
+
+    (a) Surveillance/ban exclusion list -- dependable, from your NSE files.
+    (b) Earnings/ex-date proximity from yfinance -- best-effort; FAILS OPEN if the
+        calendar is unavailable (common for NSE names), returning not-blocked so a
+        data gap never silently drops the whole universe. When it does fail, the
+        caller logs it so you know the earnings check did not actually run.
+    """
+    ev = config.get("events", {})
+    sym = symbol.upper().replace(".NS", "")
+    if sym in exclusion_set:
+        return True, "on surveillance/ban exclusion list"
+
+    earn_days = int(ev.get("earnings_blackout_days", 0))
+    corp_days = int(ev.get("corp_action_blackout_days", 0))
+    if earn_days <= 0 and corp_days <= 0:
+        return False, "proximity check disabled"
+
+    try:
+        cal = yf.Ticker(f"{sym}.NS").calendar or {}
+    except Exception:
+        return False, "earnings/ex-date data unavailable (check skipped)"
+
+    today = datetime.now(IST).date()
+
+    def _within(value, days_window: int) -> bool:
+        if not value or days_window <= 0:
+            return False
+        items = value if isinstance(value, (list, tuple)) else [value]
+        for item in items:
+            try:
+                d = pd.Timestamp(item).date()
+            except Exception:
+                continue
+            if 0 <= (d - today).days <= days_window:
+                return True
+        return False
+
+    if isinstance(cal, dict):
+        if _within(cal.get("Earnings Date"), earn_days):
+            return True, f"earnings within {earn_days} sessions"
+        if _within(cal.get("Ex-Dividend Date"), corp_days):
+            return True, f"ex-dividend within {corp_days} sessions"
+    return False, "no imminent event found"
 
 
 def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
@@ -982,7 +1068,8 @@ def get_company_name(info: Dict[str, Any], symbol: str) -> str:
     return str(info.get("longName") or info.get("shortName") or symbol).strip()
 
 
-def scan_symbol(symbol_row: pd.Series, config: Dict[str, Any], drop_partial: bool = True) -> Optional[StockResult]:
+def scan_symbol(symbol_row: pd.Series, config: Dict[str, Any], drop_partial: bool = True,
+                exclusion_set: Optional[set] = None) -> Optional[StockResult]:
     symbol = str(symbol_row["Symbol"])
     fallback_sector = str(symbol_row.get("Sector", "Default"))
     history, info = fetch_stock_data(symbol, drop_partial=drop_partial)
@@ -998,6 +1085,13 @@ def scan_symbol(symbol_row: pd.Series, config: Dict[str, Any], drop_partial: boo
             layer1["avg_volume_20d"],
         )
         return None
+
+    # MOD G: event / announcement gate (after the cheap Layer-1 filter).
+    if bool(config.get("events", {}).get("enabled", True)):
+        blocked, reason = check_event_blackout(symbol, config, exclusion_set or set())
+        if blocked:
+            LOGGER.info("%s skipped by event gate: %s", symbol, reason)
+            return None
 
     history = add_indicators(history)
     validate_indicator_snapshot(history)
@@ -1275,11 +1369,14 @@ def main() -> int:
                   f"[dim](strategy v{STRATEGY_VERSION})[/dim]")
     band_state = "ON" if config["trade"].get("enforce_return_band", True) else "OFF"
     regime_enabled = bool(config.get("regime", {}).get("enabled", True))
+    events_enabled = bool(config.get("events", {}).get("enabled", True))
+    exclusion_set = load_exclusion_set(config) if events_enabled else set()   # MOD G
     CONSOLE.print(
         f"[bold cyan]Scan filters:[/bold cyan] ₹{config['screener']['min_price']:.0f} to ₹{config['screener']['max_price']:.0f}, "
         f"20D turnover > ₹{config['screener'].get('min_turnover_inr', 0)/1e7:.1f}cr | "
         f"return band {config['trade']['return_band_min']:.0f}-{config['trade']['return_band_max']:.0f}% [{band_state}] | "
         f"regime gate [{'ON' if regime_enabled else 'OFF'}] | "
+        f"event gate [{'ON' if events_enabled else 'OFF'}, {len(exclusion_set)} excluded] | "
         f"partial-bar drop {'ON' if drop_partial else 'OFF'}"
     )
 
@@ -1308,7 +1405,7 @@ def main() -> int:
         symbol = str(row["Symbol"])
         CONSOLE.print(f"[blue]Scanning {index}/{len(universe)}:[/blue] {symbol}")
         try:
-            result = scan_symbol(row, config, drop_partial=drop_partial)
+            result = scan_symbol(row, config, drop_partial=drop_partial, exclusion_set=exclusion_set)
             if result is not None:
                 results.append(result)
                 LOGGER.info(
